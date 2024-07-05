@@ -26,7 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/wealdtech/go-ens/v3/contracts/offchainresolver"
 	"github.com/wealdtech/go-ens/v3/contracts/resolver"
 )
 
@@ -41,30 +41,25 @@ type Resolver struct {
 	Contract     *resolver.Contract
 	ContractAddr common.Address
 	domain       string
+	backend      bind.ContractBackend
+	offResolver  *offchainresolver.Contract
 }
 
 // NewResolver obtains an ENS resolver for a given domain.
 func NewResolver(backend bind.ContractBackend, domain string) (*Resolver, error) {
-	registry, err := NewRegistry(backend)
+	ur, err := NewUniversalResolver(backend)
 	if err != nil {
 		return nil, err
 	}
-
-	// Ensure the name is registered.
-	ownerAddress, err := registry.Owner(domain)
+	lhash, err := DNSEncode(domain)
 	if err != nil {
 		return nil, err
 	}
-	if bytes.Equal(ownerAddress.Bytes(), UnknownAddress.Bytes()) {
+	rAddr, _, _, err := ur.Contract.FindResolver(nil, lhash)
+	if err != nil || rAddr == common.Address(zeroHash) {
 		return nil, errors.New("unregistered name")
 	}
-
-	// Obtain the resolver address for this domain.
-	resolver, err := registry.ResolverAddress(domain)
-	if err != nil {
-		return nil, err
-	}
-	return NewResolverAt(backend, domain, resolver)
+	return NewResolverAt(backend, domain, rAddr)
 }
 
 // NewResolverAt obtains an ENS resolver at a given address.
@@ -74,16 +69,8 @@ func NewResolverAt(backend bind.ContractBackend, domain string, address common.A
 		return nil, err
 	}
 
-	// Ensure this really is a resolver contract.
-	nameHash, err := NameHash("test.eth")
+	offR, err := offchainresolver.NewContract(address, backend)
 	if err != nil {
-		return nil, err
-	}
-	_, err = contract.Addr(nil, nameHash)
-	if err != nil {
-		if err.Error() == "no contract code at given address" {
-			return nil, errors.New("no resolver")
-		}
 		return nil, err
 	}
 
@@ -91,6 +78,8 @@ func NewResolverAt(backend bind.ContractBackend, domain string, address common.A
 		Contract:     contract,
 		ContractAddr: address,
 		domain:       domain,
+		backend:      backend,
+		offResolver:  offR,
 	}, nil
 }
 
@@ -101,11 +90,45 @@ func PublicResolverAddress(backend bind.ContractBackend) (common.Address, error)
 
 // Address returns the Ethereum address of the domain.
 func (r *Resolver) Address() (common.Address, error) {
-	nameHash, err := NameHash(r.domain)
+	node, err := NameHash(r.domain)
 	if err != nil {
 		return UnknownAddress, err
 	}
-	return r.Contract.Addr(nil, nameHash)
+	addr, err := r.Contract.Addr(nil, node)
+	if err == nil && addr != common.Address(zeroHash) {
+		return addr, err
+	}
+	ccipErr, errData := getCcipReadError(err)
+
+	// CCIP Read check
+	if !ccipErr {
+		rAbi, _ := resolver.ContractMetaData.GetAbi()
+		m := rAbi.Methods["addr"]
+		args, _ := m.Inputs.Pack(node)
+		lhash, err := DNSEncode(r.domain)
+		if err != nil {
+			return common.Address{}, err
+		}
+		rawAddr, err := r.offResolver.Resolve(nil, lhash, append(m.ID, args...))
+		if err == nil {
+			// resolved on-chain
+			return common.BytesToAddress(rawAddr), nil
+		}
+		ccipErr, errData = getCcipReadError(err)
+		if errData == "" && addr == common.Address(zeroHash) {
+			return UnknownAddress, errors.New("unregistered name")
+		}
+	}
+
+	if !ccipErr {
+		return UnknownAddress, errors.New("unregistered name")
+	}
+
+	rawAddr, err := CCIPRead(r.backend, r.ContractAddr, errData)
+	if err != nil || bytes.Equal(rawAddr, zeroHash) {
+		return UnknownAddress, errors.New("unregistered name")
+	}
+	return common.BytesToAddress(rawAddr), nil
 }
 
 // SetAddress sets the Ethereum address of the domain.
@@ -217,50 +240,11 @@ func resolveName(backend bind.ContractBackend, input string) (common.Address, er
 }
 
 func resolveHash(backend bind.ContractBackend, domain string) (common.Address, error) {
-	r, err := NewUniversalResolver(backend)
+	r, err := NewResolver(backend, domain)
 	if err != nil {
 		return UnknownAddress, err
 	}
-
-	// Resolve the domain.
-	hash, err := NameHash(domain)
-	if err != nil {
-		return UnknownAddress, err
-	}
-	abi, err := resolver.ContractMetaData.GetAbi()
-	if err != nil {
-		return UnknownAddress, err
-	}
-	input, err := abi.Pack("addr", hash)
-	if err != nil {
-		return UnknownAddress, err
-	}
-	dnsdomain, err := DNSEncode(domain)
-	if err != nil {
-		return UnknownAddress, err
-	}
-	address, r1, err := r.Contract.Resolve(
-		nil,
-		dnsdomain,
-		input,
-		[]string{},
-	)
-	if err != nil {
-		var jsonErr = err.(rpc.DataError)
-		errData := fmt.Sprintf("%v", jsonErr.ErrorData())
-		if errData[:10] == offchainLookupSignature {
-			return UnknownAddress, errors.New("external resolver")
-		}
-		return UnknownAddress, errors.New("unregistered name")
-	}
-	if r1 == UnknownAddress {
-		return UnknownAddress, errors.New("no resolver")
-	}
-	if bytes.Equal(address, zeroHash) {
-		return UnknownAddress, errors.New("no address")
-	}
-
-	return common.BytesToAddress(address), nil
+	return r.Address()
 }
 
 // SetText sets the text associated with a name.
@@ -274,11 +258,42 @@ func (r *Resolver) SetText(opts *bind.TransactOpts, name string, value string) (
 
 // Text obtains the text associated with a name.
 func (r *Resolver) Text(name string) (string, error) {
-	nameHash, err := NameHash(r.domain)
+	node, err := NameHash(r.domain)
 	if err != nil {
 		return "", err
 	}
-	return r.Contract.Text(nil, nameHash, name)
+	text, err := r.Contract.Text(nil, node, name)
+	if err == nil {
+		return text, nil
+	}
+
+	ccipErr, errData := getCcipReadError(err)
+	rAbi, _ := resolver.ContractMetaData.GetAbi()
+	m := rAbi.Methods["text"]
+
+	if !ccipErr {
+		lhash, err := DNSEncode(r.domain)
+		if err != nil {
+			return "", err
+		}
+
+		args, _ := m.Inputs.Pack(node, name)
+		rawResp, err := r.offResolver.Resolve(nil, lhash, append(m.ID, args...))
+		if err == nil {
+			return string(rawResp), err
+		}
+		_, errData = getCcipReadError(err)
+	}
+
+	rawResp, err := CCIPRead(r.backend, r.ContractAddr, errData)
+	if err != nil {
+		return "", err
+	}
+	x, err := m.Outputs.Unpack(rawResp)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprint(x[0]), nil
 }
 
 // SetABI sets the ABI associated with a name.
